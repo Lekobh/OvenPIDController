@@ -1,86 +1,231 @@
 // Controlador PID para o forninho/cultura bactéria
-// Autor: Emiliano Sauvisky <esauvisky@gmail.com> 
+// 
 // Fork Alexandre <lekobh@gmail.com>
-
-// TODO: Adicionar controles para mudar setPoint em tempo real
-// TODO: Testar ativar P_ON_M quando o gap entre input e setPoint for pequeno
+// Mudei quase tudo usando a saida um aproximador 
+// NEste momento totalmente zoneado  depois vou organizar para ficar inteligivel...
 
 /**************************
         Bibliotecas
 **************************/
-//#include <max6675.h>
 #include <OneWire.h>
-#include <LiquidCrystal.h>
-#include <Wire.h>
 #include <PID_v1.h>
-
-/**************************
-  Definição de constantes
-**************************/
-// Pinos do Módulo MAX6675
-//#define THERMO_GND 6
-//#define THERMO_VCC 5
-//#define THERMO_DO  4
-//#define THERMO_CS  3
-//#define THERMO_CLK 2
+#include <PID_AutoTune_v0.h>
+#include <EEPROM.h>
 
 
-// Pinos do Sensor DS18B20
-OneWire  ds(2);  // on pin 2 (a 4.7K resistor is necessary)
 
+//Define Variables E2PROM salvar valores kp,ki,kd
+int address = 0;
+byte value;
+int addrKp = 10;
+int addrKi = 20;
+int addrKd = 30;
 
-// Pinos do LCD
-#define LCD_RS 8
-#define LCD_EN 9
-#define LCD_D4 10
-#define LCD_D5 11
-#define LCD_D6 12
-#define LCD_D7 13
+//Define variaveis para o autotune
+double Setpoint, Input, Output;
 
-// Símbolo ºC bonitinho para o LCD
-uint8_t degree[8] = {140, 146, 146, 140, 128, 128, 128, 128};
+// Pinos usados
+const int analogInPin = A0;  // pino analogico para etapade de teste do PID
+const int BresOutPin = 7; // Pino de saida bresenham
 
-// Definições Sensor de temperatura DS18B20
-byte i, present = 0,type_s, data[12], addr[8], addr2[8];
-float celsius, fahrenheit;
-
-// Definições PID
-double  temperature=10, setPoint=32, output;
-unsigned long lastTempUpdate, windowStartTime;
-#define WINDOW_SIZE        5000
-#define MINIMUM_RELAY_TIME 500
-#define RELAY_PIN          A0
-#define ERRO_PIN           A1
+// Pino sensor temperatura ainda não usado!
+OneWire  ds(2);  // on pin 10 (a 4.7K resistor is necessary)
+// Definições para o sensor de temperatura DS18xx
+float celsius;
 #define TEMP_READ_DELAY    1000
-#define KP                 45
-#define KI                 0.05
-#define KD                 20
-
-/***************************
-  Inicialização de Objetos
-***************************/
-// Cria o objeto do MAX6675
-//MAX6675 thermocouple(THERMO_CLK, THERMO_CS, THERMO_DO);
-
-// Cria o objeto do LCD
-LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
-
-// Cria o objeto do PID
-//PID myPID(&temperature, &output, &setPoint, KP, KI, KD, P_ON_M, DIRECT);
-PID myPID(&temperature, &output, &setPoint, KP, KI, KD, DIRECT);
+byte  present = 0,type_s, data[12], addr[8], addr2[8];
+double  temperature=10, setPoint=32;
 
 
-/* updateTemperature()
-    Atualiza a temperatura no menor tempo possível de acordo com o IC
-    Retorna true  se a temperatura foi atualizada
-    Retorna false se ainda não passou o tempo para realizar nova leitura */
+int sensorValue = 0;        // value read from the pino analogico de teste
+int outputValue = 0;        // value output to the PWM (analog out)
+
+// Variaveis para o calculo do bresenham
+int  N, I, E;
+int M = 40;// 40 = 1 segundo! 200; // cada ciclo 8,33ms cada 3 ciclos 25ms...  (200*3) /120 ciclos por segundo = 5 segundos 
+unsigned long int tempo, ciclos, lastTempUpdate;
+
+
+// Autotune
+byte ATuneModeRemember=2;
+double kp=0.16,ki=0.01,kd=0.00;
+double kpmodel=1.5, taup=100, theta[50];
+double outputStart=5;
+double aTuneStep=M/2, aTuneNoise=1, aTuneStartValue=M;
+unsigned int aTuneLookBack=20;
+boolean tuning = false;
+unsigned long  modelTime, serialTime;
+
+
+//Specify the links and initial tuning parameters
+PID myPID(&Input, &Output, &Setpoint,kp,ki,kd,P_ON_M, DIRECT); //   P_ON_M,   P_ON_M specifies that Proportional on Measurement be used
+PID_ATune aTune(&Input, &Output);
+//set to false to connect to the real world
+//boolean useSimulation = false;
+
+
+
+
+
+void setup() {
+  // initialize serial communications at 9600 bps:
+  Serial.begin(115200);
+  
+  //Verifica e limpa a E2Prom
+  if (EEPROM.read(0)) Limpae2prom();
+  //Verifica se é a primeira vez que inicializa
+  if (!EEPROM.read(1)) {
+      //Verificar se realmente faz diferença
+      myPID.SetTunings(myPID.GetKp(),myPID.GetKi(),myPID.GetKd(),P_ON_E); // Volta ao controle para ir mais rapido.
+      changeAutoTune(); // Ajusta valores do PID
+  } else Lee2prom(); // Se não é a primeira vez Carrega os valores do ultimo ajuste do PID
+
+ 
+  iniciads();
+        
+  //initialize the variables we're linked to
+  Input = analogRead(analogInPin);
+  Setpoint = 512;
+  
+  //turn the PID on
+  myPID.SetMode(AUTOMATIC);
+  
+  if(tuning)
+  {
+    tuning=false;
+    changeAutoTune();
+    tuning=true;
+  }
+  serialTime = 0;
+ 
+  
+  myPID.SetSampleTime(1000);
+  myPID.SetOutputLimits(0, M); // M é o numero de ciclos do bresenham
+  tempo=0;
+  ciclos=0;
+  
+  //Config o pino de saída
+  pinMode(BresOutPin, OUTPUT);
+  CAPTU(); 
+
+  //myPID.setBangBang(M);
+  //myPID2.setTimeStep(1000);
+  
+}
+
+void loop() {
+ if (tempo == 0) tempo = millis();
+   //unsigned long now = millis();
+  //Serial.print(millis());
+  //Serial.print("  *  ");
+  //Serial.println(tempo + (25*M));
+
+//unsigned long currentMillis = millis();
+   Input = analogRead(0);
+  if(tuning)
+  {
+    byte val = (aTune.Runtime());
+  
+    if (val!=0)
+    {
+      tuning = false;
+    }
+    if(!tuning)
+    { //we're done, set the tuning parameters
+      kp = aTune.GetKp();
+      ki = aTune.GetKi();
+      kd = aTune.GetKd();
+      myPID.SetTunings(kp,ki,kd);
+      AutoTuneHelper(false);
+      
+    }
+  } else {
+     myPID.Compute();
+
+   
+   if ((millis() - tempo) > 1000){
+
+    CAPTU();  
+   }
+  }
+  // wait 2 milliseconds before the next loop for the analog-to-digital
+  // converter to settle after the last reading:
+  BRES();
+if(millis()>serialTime)
+  {
+    SerialReceive();
+    SerialSend();
+    serialTime+=1000;
+    if(tuning) CAPTU(); 
+  }
+  //updateTemperature();
+}
+
+void BRES(){
+
+ if ((millis() - ciclos) >= 25){
+    ciclos = millis(); 
+    if (I < M){
+      if (E >= 0){
+          E = E + 2*(N-M);
+         // Serial.println ("1 ");
+          digitalWrite(BresOutPin, HIGH);
+      }
+      else {
+          E=E + 2*N;
+         // Serial.println ("0 ");
+          digitalWrite(BresOutPin, LOW);
+      }
+        
+    }
+    else I=0;
+
+}
+
+}
+
+void CAPTU(){
+
+  //    Serial.println(tempo);
+  // read the analog in value:
+  if(!tuning){
+        Input = analogRead(0);
+        myPID.Compute();
+    }
+  //myPID2.run(); 
+  N = Output;
+  // change the analog out value:
+  //analogWrite(analogOutPin, outputValue);
+
+
+  // print the results to the Serial Monitor:
+/*  Serial.print("sensor = ");
+  Serial.print(Input);
+  Serial.print("\t output = ");
+  Serial.println(N);
+
+  Serial.print("\t Kp = ");
+  Serial.print(myPID.GetKp());
+  Serial.print("\t Ki = ");
+  Serial.print(myPID.GetKi());
+  Serial.print("\t Kd = ");
+  Serial.println(myPID.GetKd());
+*/
+
+  
+   E= 2*N - M;
+  //Serial.println ("\n Algoritmo de Bresenham – distribui igualmente N ciclos dentro do peridodo de M ciclos");
+     tempo = millis();
+   
+}
+
 void updateTemperature() {
    if ((millis() - lastTempUpdate) > TEMP_READ_DELAY) {
  
           ds.reset();
           ds.select(addr);    
           ds.write(0xBE);         // Read Scratchpad
-          for ( i = 0; i < 9; i++) {           // we need 9 bytes
+          for (int i = 0; i < 9; i++) {           // we need 9 bytes
             data[i] = ds.read();
           }
         
@@ -109,24 +254,17 @@ void updateTemperature() {
           }
           celsius = (float)raw / 16.0;
           temperature = celsius;
-         }
+          Serial.print ("T= ");
+          Serial.println (temperature);
+
+                  }
+   
    }
-  
-  /***************************
-        Pre-Configurações
-  ***************************/
-  void setup() {
-      Serial.begin(9600);
-  
-  // Define a temperatura desejada
-        setPoint = 32;
-  
-  // Define o pino do relay como um output
-      pinMode(RELAY_PIN, OUTPUT);
-     
-      pinMode(ERRO_PIN, OUTPUT);  
- 
-  // Aguarda a inicialização do DS18B20
+
+
+void iniciads(){
+       // Aguarda a inicialização do DS18B20
+       Serial.println ("Inicia o DS18B20");
        while ( !ds.search(addr)) {
           ds.reset_search();
          delay(250);
@@ -136,76 +274,118 @@ void updateTemperature() {
        ds.write(0x4E); // write on scratchPad
        ds.write(0x00); // User byte 0 - Unused
        ds.write(0x00); // User byte 1 - Unused
-       ds.write(0x7F); // set up en 9 bits 0x0F para 12 colocar (0x7F)
+       ds.write(0x0F); // set up en 9 bits 0x0F para 12 colocar (0x7F)
        ds.reset(); // reset 1-Wire
        //ds.reset();
        ds.select(addr);
        ds.write(0x44, 1);        // start conversion, with parasite power on at the end
        lastTempUpdate = millis();
-  
-  // Inicia o módulo do LCD (2 linhas, 16 colunas por linha)
-       lcd.begin(16, 2);
-  
-  // Cria o símbolo de graus ao LCD
-      lcd.createChar(0, degree);
-      lcd.clear();
+   }
 
-  // Seta o output do myPID entre 0 e WINDOW_SIZE.
-      myPID.SetOutputLimits(0, WINDOW_SIZE);
-  
-  // Seta o sampling time para 125ms
-      myPID.SetSampleTime(125);
-  
-  // Inicializa o PID
-      myPID.SetMode(AUTOMATIC);
+
+void changeAutoTune()
+{
+  Serial.println("changeAutoTune");
+ if(!tuning)
+  {
+    //Set the output to the desired starting frequency.
+    Output=aTuneStartValue;
+    aTune.SetNoiseBand(aTuneNoise);
+    aTune.SetOutputStep(aTuneStep);
+    aTune.SetLookbackSec((int)aTuneLookBack);
+    AutoTuneHelper(true);
+    tuning = true;
+    Serial.println("****TUNING***");
+  }
+  else
+  { //cancel autotune
+    
+    aTune.Cancel();
+    tuning = false;
+    AutoTuneHelper(false);
+  }
+}
+
+void AutoTuneHelper(boolean start)
+{
+  if(start){
+    ATuneModeRemember = myPID.GetMode();
+    Serial.print("GETMODE: ");
+    Serial.println(myPID.GetMode());
+  }else{
+    Serial.println("*NOTUNING*");
+    myPID.SetMode(ATuneModeRemember);
+    myPID.SetTunings(myPID.GetKp(),myPID.GetKi(),myPID.GetKd(),P_ON_M); // Volta ao controle para ir mais rapido.
+    Atualie2prom();
+  }
+}
+
+
+void SerialSend()
+{
+  Serial.print("setpoint: ");Serial.print(Setpoint); Serial.print(" ");
+  Serial.print("input: ");Serial.print(Input); Serial.print(" ");
+  Serial.print("output: ");Serial.print(Output); Serial.print(" ");
+  if(tuning){
+    Serial.println("tuning mode");
+  } else {
+    Serial.print("kp: ");Serial.print(myPID.GetKp());Serial.print(" ");
+    Serial.print("ki: ");Serial.print(myPID.GetKi());Serial.print(" ");
+    Serial.print("kd: ");Serial.print(myPID.GetKd());Serial.println();
+  }
+}
+
+void SerialReceive()
+{
+  if(Serial.available())
+  {
+   char b = Serial.read(); 
+   Serial.flush(); 
+   if((b=='1' && !tuning) || (b!='1' && tuning))changeAutoTune();
+  }
+}
+
+void DoModel()
+{
+  //cycle the dead time
+  for(byte i=0;i<49;i++)
+  {
+    theta[i] = theta[i+1];
+  }
+  //compute the input
+  Input = (kpmodel / taup) *(theta[0]-outputStart) + Input*(1-1/taup) + ((float)random(-10,10))/100;
 
 }
 
 
-/***************************
-       Loop Principal
-***************************/
-void loop() {
-    // Faz controle de tempo proporcional para determinar se o relê deve ser ligado ou não
-    unsigned long now = millis();
-    if (now - windowStartTime > WINDOW_SIZE) {
-        // Limpa o LCD a cada ciclo
-        lcd.clear();
-        windowStartTime += WINDOW_SIZE;
-    }
+void   Limpae2prom()
+{
+    for (int j = 0 ; j < EEPROM.length() ; j++) {
+    EEPROM.write(j, 0);
+  }
+}
 
-    // Atualiza a temperatura
-    updateTemperature();
+void   Atualie2prom()
+{
+      Serial.println("Escreve EEPROM");
+      EEPROM.write(1, 1);
+      EEPROM.put(addrKp, myPID.GetKp());
+      EEPROM.put(addrKi, myPID.GetKi());
+      EEPROM.put(addrKd, myPID.GetKd());
+      Serial.print("kp: ");Serial.print(myPID.GetKp());Serial.print(" ");
+      Serial.print("ki: ");Serial.print(myPID.GetKi());Serial.print(" ");
+      Serial.print("kd: ");Serial.print(myPID.GetKd());Serial.println();
+  
+}
 
-
-
-     
-    // Roda o cálculo do PID
-    myPID.Compute();
-
-    // Imprime a primeira linha do LCD (a temperatura atual)
-    lcd.setCursor(0, 0);
-    lcd.print("Temp:"); lcd.print(temperature);
-    lcd.setCursor(14, 0);
-    lcd.write((byte)0); lcd.print("C");
-
-    // Imprime a segunda linha (o output)
-    lcd.setCursor(0, 1);
-    lcd.print("Output: "); lcd.print(int(output));
-
-    // Liga o relê baseado no output do pid
-    if (output > now - windowStartTime) {
-        // TODO: Não gastar clicks do relê se a janela for muito pequena
-        //if (output > MINIMUM_RELAY_TIME) {
-        lcd.setCursor(13, 1); lcd.print(" ON");
-        digitalWrite(RELAY_PIN, HIGH);
-        //}
-    } else {
-        //if (WINDOW_SIZE - output < MINIMUM_RELAY_TIME) {
-        lcd.setCursor(13, 1); lcd.print("OFF");
-        digitalWrite(RELAY_PIN, LOW);
-        //}
-    }
-
-    delay(50);
+void   Lee2prom()
+{
+      Serial.println("Lê EEPROM");
+      EEPROM.get(addrKp, kp);
+      EEPROM.get(addrKi, ki);
+      EEPROM.get(addrKd, kd);
+      Serial.print("kp: ");Serial.print(kp);Serial.print(" ");
+      Serial.print("ki: ");Serial.print(ki);Serial.print(" ");
+      Serial.print("kd: ");Serial.print(kd);Serial.println();
+      myPID.SetTunings(kp, ki, kd, P_ON_M); // Volta ao controle para ir mais seguro...
 }
